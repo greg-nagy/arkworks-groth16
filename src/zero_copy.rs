@@ -39,7 +39,7 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate
 use ark_std::vec::Vec;
 use sha2::{Digest, Sha256};
 
-use crate::{ProvingKey, VerifyingKey};
+use crate::{ProvingKey, ProvingKeyRef, VerifyingKey};
 
 /// Magic bytes identifying a zero-copy proving key file.
 pub const MAGIC: &[u8; 4] = b"ZPK1";
@@ -359,6 +359,288 @@ pub fn deserialize_vk<E: Pairing>(data: &[u8]) -> Result<VerifyingKey<E>, ZeroCo
         .map_err(|e| ZeroCopyError::SerializationError(e.to_string()))
 }
 
+/// A proving key loaded from the zero-copy binary format.
+///
+/// This struct owns the deserialized curve point arrays and provides access
+/// to a [`ProvingKeyRef`] via [`Self::as_ref()`]. Loading skips expensive
+/// subgroup validation checks, providing ~40x faster load times compared
+/// to standard arkworks deserialization.
+///
+/// # Example
+///
+/// ```ignore
+/// static PK_DATA: &[u8] = include_bytes!("../keys/pk.bin");
+///
+/// // Load without validation (~50ms vs ~2s)
+/// let pk = ZeroCopyProvingKey::<Bn254>::deserialize_unchecked(PK_DATA)?;
+///
+/// // Use for proving
+/// let proof = Groth16::create_proof_with_reduction_ref(circuit, pk.as_ref(), r, s)?;
+/// ```
+///
+/// # Security Warning
+///
+/// The `deserialize_unchecked` method skips subgroup validation. Only use this
+/// with trusted key data (e.g., embedded at compile time from a verified source).
+/// For untrusted data, use [`Self::deserialize`] which performs full validation.
+#[derive(Clone, Debug)]
+pub struct ZeroCopyProvingKey<E: Pairing> {
+    /// The verification key.
+    pub vk: VerifyingKey<E>,
+    /// The element `beta * G` in `E::G1`.
+    pub beta_g1: E::G1Affine,
+    /// The element `delta * G` in `E::G1`.
+    pub delta_g1: E::G1Affine,
+    /// The elements `a_i * G` in `E::G1`.
+    pub a_query: Vec<E::G1Affine>,
+    /// The elements `b_i * G` in `E::G1`.
+    pub b_g1_query: Vec<E::G1Affine>,
+    /// The elements `b_i * H` in `E::G2`.
+    pub b_g2_query: Vec<E::G2Affine>,
+    /// The elements `h_i * G` in `E::G1`.
+    pub h_query: Vec<E::G1Affine>,
+    /// The elements `l_i * G` in `E::G1`.
+    pub l_query: Vec<E::G1Affine>,
+}
+
+impl<E: Pairing> ZeroCopyProvingKey<E> {
+    /// Returns a borrowed reference to this proving key.
+    ///
+    /// The returned [`ProvingKeyRef`] can be used with the `_ref` prover functions.
+    pub fn as_ref(&self) -> ProvingKeyRef<'_, E> {
+        ProvingKeyRef {
+            vk: self.vk.clone(),
+            beta_g1: self.beta_g1,
+            delta_g1: self.delta_g1,
+            a_query: &self.a_query,
+            b_g1_query: &self.b_g1_query,
+            b_g2_query: &self.b_g2_query,
+            h_query: &self.h_query,
+            l_query: &self.l_query,
+        }
+    }
+
+    /// Deserialize from zero-copy format WITHOUT validation.
+    ///
+    /// This is extremely fast (~50ms) but skips subgroup checks. Only use with
+    /// trusted data (e.g., keys embedded at compile time).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The magic bytes or version are invalid
+    /// - The checksum doesn't match
+    /// - The data is truncated or malformed
+    pub fn deserialize_unchecked(data: &[u8]) -> Result<Self, ZeroCopyError> {
+        Self::deserialize_inner(data, Validate::No)
+    }
+
+    /// Deserialize from zero-copy format WITH full validation.
+    ///
+    /// This performs subgroup checks on all curve points, which is slower but
+    /// safe for untrusted data.
+    pub fn deserialize(data: &[u8]) -> Result<Self, ZeroCopyError> {
+        Self::deserialize_inner(data, Validate::Yes)
+    }
+
+    fn deserialize_inner(data: &[u8], validate: Validate) -> Result<Self, ZeroCopyError> {
+        // Parse and validate header
+        let header = Header::from_bytes(data)?;
+
+        // Verify checksum
+        verify_checksum(data)?;
+
+        let g1_size = header.g1_point_size as usize;
+        let g2_size = header.g2_point_size as usize;
+
+        // Calculate offsets
+        let mut offset = HEADER_SIZE + CHECKSUM_SIZE;
+
+        // Deserialize VK
+        let vk_end = offset + header.vk_len as usize;
+        if data.len() < vk_end {
+            return Err(ZeroCopyError::DataTooShort {
+                expected: vk_end,
+                actual: data.len(),
+            });
+        }
+        let vk = VerifyingKey::deserialize_with_mode(&data[offset..vk_end], Compress::Yes, validate)
+            .map_err(|e| ZeroCopyError::SerializationError(e.to_string()))?;
+        offset = vk_end;
+
+        // Deserialize beta_g1
+        let beta_g1 = deserialize_g1_point::<E>(&data[offset..], g1_size, validate)?;
+        offset += g1_size;
+
+        // Deserialize delta_g1
+        let delta_g1 = deserialize_g1_point::<E>(&data[offset..], g1_size, validate)?;
+        offset += g1_size;
+
+        // Deserialize a_query
+        let a_query = deserialize_g1_array::<E>(
+            &data[offset..],
+            header.a_query_len as usize,
+            g1_size,
+            validate,
+        )?;
+        offset += header.a_query_len as usize * g1_size;
+
+        // Deserialize b_g1_query
+        let b_g1_query = deserialize_g1_array::<E>(
+            &data[offset..],
+            header.b_g1_query_len as usize,
+            g1_size,
+            validate,
+        )?;
+        offset += header.b_g1_query_len as usize * g1_size;
+
+        // Deserialize b_g2_query
+        let b_g2_query = deserialize_g2_array::<E>(
+            &data[offset..],
+            header.b_g2_query_len as usize,
+            g2_size,
+            validate,
+        )?;
+        offset += header.b_g2_query_len as usize * g2_size;
+
+        // Deserialize h_query
+        let h_query = deserialize_g1_array::<E>(
+            &data[offset..],
+            header.h_query_len as usize,
+            g1_size,
+            validate,
+        )?;
+        offset += header.h_query_len as usize * g1_size;
+
+        // Deserialize l_query
+        let l_query = deserialize_g1_array::<E>(
+            &data[offset..],
+            header.l_query_len as usize,
+            g1_size,
+            validate,
+        )?;
+
+        Ok(Self {
+            vk,
+            beta_g1,
+            delta_g1,
+            a_query,
+            b_g1_query,
+            b_g2_query,
+            h_query,
+            l_query,
+        })
+    }
+
+    /// Convert to an owned [`ProvingKey`].
+    ///
+    /// This is useful for interoperability with existing code that expects
+    /// the standard arkworks type.
+    pub fn into_proving_key(self) -> ProvingKey<E> {
+        ProvingKey {
+            vk: self.vk,
+            beta_g1: self.beta_g1,
+            delta_g1: self.delta_g1,
+            a_query: self.a_query,
+            b_g1_query: self.b_g1_query,
+            b_g2_query: self.b_g2_query,
+            h_query: self.h_query,
+            l_query: self.l_query,
+        }
+    }
+}
+
+/// Deserialize a single G1 point.
+fn deserialize_g1_point<E: Pairing>(
+    data: &[u8],
+    expected_size: usize,
+    validate: Validate,
+) -> Result<E::G1Affine, ZeroCopyError> {
+    if data.len() < expected_size {
+        return Err(ZeroCopyError::DataTooShort {
+            expected: expected_size,
+            actual: data.len(),
+        });
+    }
+    E::G1Affine::deserialize_with_mode(&data[..expected_size], Compress::No, validate)
+        .map_err(|e| ZeroCopyError::SerializationError(e.to_string()))
+}
+
+/// Deserialize a single G2 point.
+#[allow(dead_code)]
+fn deserialize_g2_point<E: Pairing>(
+    data: &[u8],
+    expected_size: usize,
+    validate: Validate,
+) -> Result<E::G2Affine, ZeroCopyError> {
+    if data.len() < expected_size {
+        return Err(ZeroCopyError::DataTooShort {
+            expected: expected_size,
+            actual: data.len(),
+        });
+    }
+    E::G2Affine::deserialize_with_mode(&data[..expected_size], Compress::No, validate)
+        .map_err(|e| ZeroCopyError::SerializationError(e.to_string()))
+}
+
+/// Deserialize an array of G1 points.
+fn deserialize_g1_array<E: Pairing>(
+    data: &[u8],
+    count: usize,
+    point_size: usize,
+    validate: Validate,
+) -> Result<Vec<E::G1Affine>, ZeroCopyError> {
+    let total_size = count * point_size;
+    if data.len() < total_size {
+        return Err(ZeroCopyError::DataTooShort {
+            expected: total_size,
+            actual: data.len(),
+        });
+    }
+
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let start = i * point_size;
+        let point = E::G1Affine::deserialize_with_mode(
+            &data[start..start + point_size],
+            Compress::No,
+            validate,
+        )
+        .map_err(|e| ZeroCopyError::SerializationError(e.to_string()))?;
+        result.push(point);
+    }
+    Ok(result)
+}
+
+/// Deserialize an array of G2 points.
+fn deserialize_g2_array<E: Pairing>(
+    data: &[u8],
+    count: usize,
+    point_size: usize,
+    validate: Validate,
+) -> Result<Vec<E::G2Affine>, ZeroCopyError> {
+    let total_size = count * point_size;
+    if data.len() < total_size {
+        return Err(ZeroCopyError::DataTooShort {
+            expected: total_size,
+            actual: data.len(),
+        });
+    }
+
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let start = i * point_size;
+        let point = E::G2Affine::deserialize_with_mode(
+            &data[start..start + point_size],
+            Compress::No,
+            validate,
+        )
+        .map_err(|e| ZeroCopyError::SerializationError(e.to_string()))?;
+        result.push(point);
+    }
+    Ok(result)
+}
+
 /// Serialize a G1 affine point using its raw memory representation.
 fn serialize_g1_point<E: Pairing>(output: &mut Vec<u8>, point: &E::G1Affine) -> Result<(), ZeroCopyError> {
     // Use uncompressed serialization for predictable size
@@ -516,6 +798,99 @@ mod tests {
             verify_checksum(&data),
             Err(ZeroCopyError::ChecksumMismatch)
         ));
+    }
+
+    #[test]
+    fn test_zero_copy_roundtrip() {
+        use crate::Groth16;
+        use ark_crypto_primitives::snark::SNARK;
+
+        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(test_rng().next_u64());
+
+        // Generate a proving key
+        let circuit = TestCircuit::<ark_bn254::Fr> { a: None, b: None };
+        let (pk, _vk) = Groth16::<Bn254>::circuit_specific_setup(circuit, &mut rng).unwrap();
+
+        // Serialize to zero-copy format
+        let data = serialize(&pk).unwrap();
+
+        // Deserialize without validation
+        let zc_pk = ZeroCopyProvingKey::<Bn254>::deserialize_unchecked(&data).unwrap();
+
+        // Verify all arrays have correct lengths
+        assert_eq!(zc_pk.a_query.len(), pk.a_query.len());
+        assert_eq!(zc_pk.b_g1_query.len(), pk.b_g1_query.len());
+        assert_eq!(zc_pk.b_g2_query.len(), pk.b_g2_query.len());
+        assert_eq!(zc_pk.h_query.len(), pk.h_query.len());
+        assert_eq!(zc_pk.l_query.len(), pk.l_query.len());
+
+        // Verify scalar points match
+        assert_eq!(zc_pk.beta_g1, pk.beta_g1);
+        assert_eq!(zc_pk.delta_g1, pk.delta_g1);
+
+        // Verify VK matches
+        assert_eq!(zc_pk.vk.alpha_g1, pk.vk.alpha_g1);
+        assert_eq!(zc_pk.vk.beta_g2, pk.vk.beta_g2);
+        assert_eq!(zc_pk.vk.gamma_g2, pk.vk.gamma_g2);
+        assert_eq!(zc_pk.vk.delta_g2, pk.vk.delta_g2);
+
+        // Verify array contents match
+        for (a, b) in zc_pk.a_query.iter().zip(pk.a_query.iter()) {
+            assert_eq!(a, b);
+        }
+        for (a, b) in zc_pk.h_query.iter().zip(pk.h_query.iter()) {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn test_zero_copy_proving() {
+        use crate::{prepare_verifying_key, Groth16};
+        use ark_crypto_primitives::snark::SNARK;
+        use ark_ff::UniformRand;
+
+        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(12345);
+
+        // Generate keys
+        let circuit = TestCircuit::<ark_bn254::Fr> { a: None, b: None };
+        let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(circuit, &mut rng).unwrap();
+        let pvk = prepare_verifying_key(&vk);
+
+        // Serialize and deserialize
+        let data = serialize(&pk).unwrap();
+        let zc_pk = ZeroCopyProvingKey::<Bn254>::deserialize_unchecked(&data).unwrap();
+
+        // Create witness values
+        let a = ark_bn254::Fr::rand(&mut rng);
+        let b = ark_bn254::Fr::rand(&mut rng);
+        let c = a * b;
+
+        // Generate proof using original ProvingKey
+        let mut rng1 = ark_std::rand::rngs::StdRng::seed_from_u64(99999);
+        let proof_original = Groth16::<Bn254>::create_random_proof_with_reduction(
+            TestCircuit { a: Some(a), b: Some(b) },
+            &pk,
+            &mut rng1,
+        )
+        .unwrap();
+
+        // Generate proof using ZeroCopyProvingKey via as_ref()
+        let mut rng2 = ark_std::rand::rngs::StdRng::seed_from_u64(99999);
+        let proof_zc = Groth16::<Bn254>::create_random_proof_with_reduction_ref(
+            TestCircuit { a: Some(a), b: Some(b) },
+            &zc_pk.as_ref(),
+            &mut rng2,
+        )
+        .unwrap();
+
+        // Proofs should be identical
+        assert_eq!(proof_original.a, proof_zc.a);
+        assert_eq!(proof_original.b, proof_zc.b);
+        assert_eq!(proof_original.c, proof_zc.c);
+
+        // Both should verify
+        assert!(Groth16::<Bn254>::verify_with_processed_vk(&pvk, &[c], &proof_original).unwrap());
+        assert!(Groth16::<Bn254>::verify_with_processed_vk(&pvk, &[c], &proof_zc).unwrap());
     }
 }
 
