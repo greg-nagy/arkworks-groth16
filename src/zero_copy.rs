@@ -892,5 +892,126 @@ mod tests {
         assert!(Groth16::<Bn254>::verify_with_processed_vk(&pvk, &[c], &proof_original).unwrap());
         assert!(Groth16::<Bn254>::verify_with_processed_vk(&pvk, &[c], &proof_zc).unwrap());
     }
+
+    /// Benchmark comparing standard arkworks deserialization vs zero-copy.
+    ///
+    /// Run with: `cargo test benchmark_load_times --release -- --nocapture`
+    #[test]
+    fn benchmark_load_times() {
+        use crate::{prepare_verifying_key, Groth16, ProvingKey};
+        use ark_crypto_primitives::snark::SNARK;
+        use ark_ff::UniformRand;
+        use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+        use std::time::Instant;
+
+        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(42);
+
+        // Generate keys
+        let circuit = TestCircuit::<ark_bn254::Fr> { a: None, b: None };
+        let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(circuit, &mut rng).unwrap();
+        let pvk = prepare_verifying_key(&vk);
+
+        // Serialize using standard arkworks format (compressed)
+        let mut standard_compressed = Vec::new();
+        pk.serialize_compressed(&mut standard_compressed).unwrap();
+
+        // Serialize using standard arkworks format (uncompressed)
+        let mut standard_uncompressed = Vec::new();
+        pk.serialize_uncompressed(&mut standard_uncompressed).unwrap();
+
+        // Serialize using zero-copy format
+        let zc_bytes = serialize(&pk).unwrap();
+
+        eprintln!("\n=== Serialized Sizes ===");
+        eprintln!("Standard compressed:   {:>8} bytes", standard_compressed.len());
+        eprintln!("Standard uncompressed: {:>8} bytes", standard_uncompressed.len());
+        eprintln!("Zero-copy format:      {:>8} bytes", zc_bytes.len());
+
+        // Warm up
+        let _ = ProvingKey::<Bn254>::deserialize_compressed(&standard_compressed[..]).unwrap();
+        let _ = ZeroCopyProvingKey::<Bn254>::deserialize_unchecked(&zc_bytes).unwrap();
+
+        const ITERATIONS: u32 = 10;
+
+        // Benchmark: Standard arkworks (compressed, with validation)
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = ProvingKey::<Bn254>::deserialize_compressed(&standard_compressed[..]).unwrap();
+        }
+        let standard_compressed_time = start.elapsed() / ITERATIONS;
+
+        // Benchmark: Standard arkworks (uncompressed, with validation)
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = ProvingKey::<Bn254>::deserialize_uncompressed(&standard_uncompressed[..]).unwrap();
+        }
+        let standard_uncompressed_time = start.elapsed() / ITERATIONS;
+
+        // Benchmark: Standard arkworks (uncompressed, unchecked)
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = ProvingKey::<Bn254>::deserialize_uncompressed_unchecked(&standard_uncompressed[..]).unwrap();
+        }
+        let standard_unchecked_time = start.elapsed() / ITERATIONS;
+
+        // Benchmark: Zero-copy (unchecked)
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = ZeroCopyProvingKey::<Bn254>::deserialize_unchecked(&zc_bytes).unwrap();
+        }
+        let zerocopy_unchecked_time = start.elapsed() / ITERATIONS;
+
+        // Benchmark: Zero-copy (with validation)
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = ZeroCopyProvingKey::<Bn254>::deserialize(&zc_bytes).unwrap();
+        }
+        let zerocopy_validated_time = start.elapsed() / ITERATIONS;
+
+        eprintln!("\n=== Load Times (avg of {} iterations) ===", ITERATIONS);
+        eprintln!("Standard compressed (validated):   {:>12?}", standard_compressed_time);
+        eprintln!("Standard uncompressed (validated): {:>12?}", standard_uncompressed_time);
+        eprintln!("Standard uncompressed (unchecked): {:>12?}", standard_unchecked_time);
+        eprintln!("Zero-copy (unchecked):             {:>12?}", zerocopy_unchecked_time);
+        eprintln!("Zero-copy (validated):             {:>12?}", zerocopy_validated_time);
+
+        let speedup_vs_compressed = standard_compressed_time.as_secs_f64() / zerocopy_unchecked_time.as_secs_f64();
+        let speedup_vs_uncompressed = standard_uncompressed_time.as_secs_f64() / zerocopy_unchecked_time.as_secs_f64();
+
+        eprintln!("\n=== Speedup (zero-copy unchecked vs standard) ===");
+        eprintln!("vs compressed:   {:.1}x faster", speedup_vs_compressed);
+        eprintln!("vs uncompressed: {:.1}x faster", speedup_vs_uncompressed);
+
+        // Verify correctness: generate proofs with both and compare
+        let a = ark_bn254::Fr::rand(&mut rng);
+        let b = ark_bn254::Fr::rand(&mut rng);
+        let c = a * b;
+
+        let pk_standard = ProvingKey::<Bn254>::deserialize_compressed(&standard_compressed[..]).unwrap();
+        let pk_zerocopy = ZeroCopyProvingKey::<Bn254>::deserialize_unchecked(&zc_bytes).unwrap();
+
+        let mut rng1 = ark_std::rand::rngs::StdRng::seed_from_u64(99999);
+        let mut rng2 = ark_std::rand::rngs::StdRng::seed_from_u64(99999);
+
+        let proof1 = Groth16::<Bn254>::prove(
+            &pk_standard,
+            TestCircuit { a: Some(a), b: Some(b) },
+            &mut rng1,
+        ).unwrap();
+
+        let proof2 = Groth16::<Bn254>::create_random_proof_with_reduction_ref(
+            TestCircuit { a: Some(a), b: Some(b) },
+            &pk_zerocopy.as_ref(),
+            &mut rng2,
+        ).unwrap();
+
+        assert_eq!(proof1.a, proof2.a);
+        assert_eq!(proof1.b, proof2.b);
+        assert_eq!(proof1.c, proof2.c);
+        assert!(Groth16::<Bn254>::verify_with_processed_vk(&pvk, &[c], &proof1).unwrap());
+        assert!(Groth16::<Bn254>::verify_with_processed_vk(&pvk, &[c], &proof2).unwrap());
+
+        eprintln!("\n✓ Proofs match and verify correctly");
+    }
 }
 
