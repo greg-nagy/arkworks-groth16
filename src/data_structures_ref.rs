@@ -205,5 +205,65 @@ mod tests {
         // h_query length should be positive
         assert!(pk_ref.num_constraints_hint() > 0);
     }
+
+    #[test]
+    fn test_proof_with_ref_matches_original() {
+        use crate::{prepare_verifying_key, Groth16};
+        use ark_crypto_primitives::snark::SNARK;
+        use ark_ff::UniformRand;
+
+        // Use a fixed seed for reproducibility
+        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(12345);
+
+        // Generate keys
+        let circuit = TestCircuit::<ark_bn254::Fr> { a: None, b: None };
+        let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(circuit, &mut rng).unwrap();
+        let pvk = prepare_verifying_key(&vk);
+        let pk_ref = ProvingKeyRef::from(&pk);
+
+        // Create witness values
+        let a = ark_bn254::Fr::rand(&mut rng);
+        let b = ark_bn254::Fr::rand(&mut rng);
+        let c = a * b;
+
+        // Generate proof using ProvingKey
+        let mut rng1 = ark_std::rand::rngs::StdRng::seed_from_u64(99999);
+        let proof_owned = Groth16::<Bn254>::create_random_proof_with_reduction(
+            TestCircuit { a: Some(a), b: Some(b) },
+            &pk,
+            &mut rng1,
+        )
+        .unwrap();
+
+        // Generate proof using ProvingKeyRef with same RNG seed
+        let mut rng2 = ark_std::rand::rngs::StdRng::seed_from_u64(99999);
+        let proof_ref = Groth16::<Bn254>::create_random_proof_with_reduction_ref(
+            TestCircuit { a: Some(a), b: Some(b) },
+            &pk_ref,
+            &mut rng2,
+        )
+        .unwrap();
+
+        // Proofs should be identical (same circuit, same witness, same randomness)
+        assert_eq!(proof_owned.a, proof_ref.a, "Proof element A mismatch");
+        assert_eq!(proof_owned.b, proof_ref.b, "Proof element B mismatch");
+        assert_eq!(proof_owned.c, proof_ref.c, "Proof element C mismatch");
+
+        // Both proofs should verify
+        assert!(
+            Groth16::<Bn254>::verify_with_processed_vk(&pvk, &[c], &proof_owned).unwrap(),
+            "Owned proof failed verification"
+        );
+        assert!(
+            Groth16::<Bn254>::verify_with_processed_vk(&pvk, &[c], &proof_ref).unwrap(),
+            "Ref proof failed verification"
+        );
+
+        // Verify with wrong public input should fail
+        assert!(
+            !Groth16::<Bn254>::verify_with_processed_vk(&pvk, &[a], &proof_ref).unwrap(),
+            "Ref proof should fail with wrong public input"
+        );
+    }
 }
 

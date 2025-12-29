@@ -1,4 +1,4 @@
-use crate::{r1cs_to_qap::R1CSToQAP, Groth16, Proof, ProvingKey, VerifyingKey};
+use crate::{r1cs_to_qap::R1CSToQAP, Groth16, Proof, ProvingKey, ProvingKeyRef, VerifyingKey};
 use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup, VariableBaseMSM};
 use ark_ff::{Field, PrimeField, UniformRand, Zero};
 use ark_poly::GeneralEvaluationDomain;
@@ -59,11 +59,81 @@ impl<E: Pairing, QAP: R1CSToQAP> Groth16<E, QAP> {
         input_assignment: &[E::ScalarField],
         aux_assignment: &[E::ScalarField],
     ) -> R1CSResult<Proof<E>> {
+        Self::create_proof_inner(
+            r,
+            s,
+            h,
+            input_assignment,
+            aux_assignment,
+            &pk.a_query,
+            &pk.b_g1_query,
+            &pk.b_g2_query,
+            &pk.h_query,
+            &pk.l_query,
+            pk.beta_g1,
+            pk.delta_g1,
+            pk.vk.alpha_g1,
+            pk.vk.beta_g2,
+            pk.vk.delta_g2,
+        )
+    }
+
+    /// Create a proof using a borrowed proving key reference.
+    ///
+    /// This is the zero-copy variant that works with `ProvingKeyRef`.
+    #[inline]
+    fn create_proof_with_assignment_ref(
+        pk: &ProvingKeyRef<'_, E>,
+        r: E::ScalarField,
+        s: E::ScalarField,
+        h: &[E::ScalarField],
+        input_assignment: &[E::ScalarField],
+        aux_assignment: &[E::ScalarField],
+    ) -> R1CSResult<Proof<E>> {
+        Self::create_proof_inner(
+            r,
+            s,
+            h,
+            input_assignment,
+            aux_assignment,
+            pk.a_query,
+            pk.b_g1_query,
+            pk.b_g2_query,
+            pk.h_query,
+            pk.l_query,
+            pk.beta_g1,
+            pk.delta_g1,
+            pk.vk.alpha_g1,
+            pk.vk.beta_g2,
+            pk.vk.delta_g2,
+        )
+    }
+
+    /// Core proof generation logic shared by both `ProvingKey` and `ProvingKeyRef`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn create_proof_inner(
+        r: E::ScalarField,
+        s: E::ScalarField,
+        h: &[E::ScalarField],
+        input_assignment: &[E::ScalarField],
+        aux_assignment: &[E::ScalarField],
+        a_query: &[E::G1Affine],
+        b_g1_query: &[E::G1Affine],
+        b_g2_query: &[E::G2Affine],
+        h_query: &[E::G1Affine],
+        l_query: &[E::G1Affine],
+        beta_g1: E::G1Affine,
+        delta_g1: E::G1Affine,
+        alpha_g1: E::G1Affine,
+        beta_g2: E::G2Affine,
+        delta_g2: E::G2Affine,
+    ) -> R1CSResult<Proof<E>> {
         let c_acc_time = start_timer!(|| "Compute C");
         let h_assignment = cfg_into_iter!(h)
             .map(|s| s.into_bigint())
             .collect::<Vec<_>>();
-        let h_acc = E::G1::msm_bigint(&pk.h_query, &h_assignment);
+        let h_acc = E::G1::msm_bigint(h_query, &h_assignment);
         drop(h_assignment);
 
         // Compute C
@@ -71,9 +141,9 @@ impl<E: Pairing, QAP: R1CSToQAP> Groth16<E, QAP> {
             .map(|s| s.into_bigint())
             .collect::<Vec<_>>();
 
-        let l_aux_acc = E::G1::msm_bigint(&pk.l_query, &aux_assignment);
+        let l_aux_acc = E::G1::msm_bigint(l_query, &aux_assignment);
 
-        let r_s_delta_g1 = pk.delta_g1 * (r * s);
+        let r_s_delta_g1 = delta_g1 * (r * s);
 
         end_timer!(c_acc_time);
 
@@ -87,9 +157,9 @@ impl<E: Pairing, QAP: R1CSToQAP> Groth16<E, QAP> {
 
         // Compute A
         let a_acc_time = start_timer!(|| "Compute A");
-        let r_g1 = pk.delta_g1.mul(r);
+        let r_g1 = delta_g1.mul(r);
 
-        let g_a = Self::calculate_coeff(r_g1, &pk.a_query, pk.vk.alpha_g1, &assignment);
+        let g_a = Self::calculate_coeff(r_g1, a_query, alpha_g1, &assignment);
 
         let s_g_a = g_a * &s;
         end_timer!(a_acc_time);
@@ -97,8 +167,8 @@ impl<E: Pairing, QAP: R1CSToQAP> Groth16<E, QAP> {
         // Compute B in G1 if needed
         let g1_b = if !r.is_zero() {
             let b_g1_acc_time = start_timer!(|| "Compute B in G1");
-            let s_g1 = pk.delta_g1.mul(s);
-            let g1_b = Self::calculate_coeff(s_g1, &pk.b_g1_query, pk.beta_g1, &assignment);
+            let s_g1 = delta_g1.mul(s);
+            let g1_b = Self::calculate_coeff(s_g1, b_g1_query, beta_g1, &assignment);
 
             end_timer!(b_g1_acc_time);
 
@@ -109,8 +179,8 @@ impl<E: Pairing, QAP: R1CSToQAP> Groth16<E, QAP> {
 
         // Compute B in G2
         let b_g2_acc_time = start_timer!(|| "Compute B in G2");
-        let s_g2 = pk.vk.delta_g2.mul(s);
-        let g2_b = Self::calculate_coeff(s_g2, &pk.b_g2_query, pk.vk.beta_g2, &assignment);
+        let s_g2 = delta_g2.mul(s);
+        let g2_b = Self::calculate_coeff(s_g2, b_g2_query, beta_g2, &assignment);
         let r_g1_b = g1_b * &r;
         drop(assignment);
 
@@ -211,6 +281,130 @@ impl<E: Pairing, QAP: R1CSToQAP> Groth16<E, QAP> {
             &prover.witness_assignment,
         )?;
 
+        end_timer!(prover_time);
+
+        Ok(proof)
+    }
+
+    // ==================== ProvingKeyRef variants ====================
+    //
+    // The following functions are identical to their non-ref counterparts but accept
+    // `ProvingKeyRef` instead of `ProvingKey`, enabling zero-copy proof generation
+    // from embedded binary data.
+
+    /// Create a Groth16 proof using a borrowed proving key reference.
+    ///
+    /// This is the zero-copy variant of [`Self::create_proof_with_reduction`].
+    #[inline]
+    pub fn create_proof_with_reduction_ref<C>(
+        circuit: C,
+        pk: &ProvingKeyRef<'_, E>,
+        r: E::ScalarField,
+        s: E::ScalarField,
+    ) -> R1CSResult<Proof<E>>
+    where
+        E: Pairing,
+        C: ConstraintSynthesizer<E::ScalarField>,
+        QAP: R1CSToQAP,
+    {
+        let prover_time = start_timer!(|| "Groth16::Prover");
+        let cs = ConstraintSystem::new_ref();
+
+        // Set the optimization goal
+        cs.set_optimization_goal(OptimizationGoal::Constraints);
+
+        // Synthesize the circuit.
+        let synthesis_time = start_timer!(|| "Constraint synthesis");
+        circuit.generate_constraints(cs.clone())?;
+        debug_assert!(cs.is_satisfied().unwrap());
+        end_timer!(synthesis_time);
+
+        let lc_time = start_timer!(|| "Inlining LCs");
+        cs.finalize();
+        end_timer!(lc_time);
+
+        let witness_map_time = start_timer!(|| "R1CS to QAP witness map");
+        let h = QAP::witness_map::<E::ScalarField, D<E::ScalarField>>(cs.clone())?;
+        end_timer!(witness_map_time);
+
+        let prover = cs.borrow().unwrap();
+        let proof = Self::create_proof_with_assignment_ref(
+            pk,
+            r,
+            s,
+            &h,
+            &prover.instance_assignment[1..],
+            &prover.witness_assignment,
+        )?;
+
+        end_timer!(prover_time);
+
+        Ok(proof)
+    }
+
+    /// Create a zero-knowledge Groth16 proof using a borrowed proving key reference.
+    ///
+    /// This is the zero-copy variant of [`Self::create_random_proof_with_reduction`].
+    #[inline]
+    pub fn create_random_proof_with_reduction_ref<C>(
+        circuit: C,
+        pk: &ProvingKeyRef<'_, E>,
+        rng: &mut impl Rng,
+    ) -> R1CSResult<Proof<E>>
+    where
+        C: ConstraintSynthesizer<E::ScalarField>,
+    {
+        let r = E::ScalarField::rand(rng);
+        let s = E::ScalarField::rand(rng);
+
+        Self::create_proof_with_reduction_ref(circuit, pk, r, s)
+    }
+
+    /// Create a non-zero-knowledge Groth16 proof using a borrowed proving key reference.
+    ///
+    /// This is the zero-copy variant of [`Self::create_proof_with_reduction_no_zk`].
+    #[inline]
+    pub fn create_proof_with_reduction_no_zk_ref<C>(
+        circuit: C,
+        pk: &ProvingKeyRef<'_, E>,
+    ) -> R1CSResult<Proof<E>>
+    where
+        C: ConstraintSynthesizer<E::ScalarField>,
+    {
+        Self::create_proof_with_reduction_ref(
+            circuit,
+            pk,
+            E::ScalarField::zero(),
+            E::ScalarField::zero(),
+        )
+    }
+
+    /// Create a Groth16 proof using pre-computed matrices and a borrowed proving key.
+    ///
+    /// This is the zero-copy variant of [`Self::create_proof_with_reduction_and_matrices`].
+    #[inline]
+    pub fn create_proof_with_reduction_and_matrices_ref(
+        pk: &ProvingKeyRef<'_, E>,
+        r: E::ScalarField,
+        s: E::ScalarField,
+        matrices: &ConstraintMatrices<E::ScalarField>,
+        num_inputs: usize,
+        num_constraints: usize,
+        full_assignment: &[E::ScalarField],
+    ) -> R1CSResult<Proof<E>> {
+        let prover_time = start_timer!(|| "Groth16::Prover");
+        let witness_map_time = start_timer!(|| "R1CS to QAP witness map");
+        let h = QAP::witness_map_from_matrices::<E::ScalarField, D<E::ScalarField>>(
+            matrices,
+            num_inputs,
+            num_constraints,
+            full_assignment,
+        )?;
+        end_timer!(witness_map_time);
+        let input_assignment = &full_assignment[1..num_inputs];
+        let aux_assignment = &full_assignment[num_inputs..];
+        let proof =
+            Self::create_proof_with_assignment_ref(pk, r, s, &h, input_assignment, aux_assignment)?;
         end_timer!(prover_time);
 
         Ok(proof)
