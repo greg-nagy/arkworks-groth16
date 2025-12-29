@@ -28,6 +28,9 @@ pub mod data_structures;
 /// Zero-copy data structures for efficient proving key loading.
 pub mod data_structures_ref;
 
+/// Zero-copy binary format for proving keys.
+pub mod zero_copy;
+
 /// Generate public parameters for the Groth16 zkSNARK construction.
 pub mod generator;
 
