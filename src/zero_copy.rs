@@ -36,7 +36,7 @@
 
 use ark_ec::pairing::Pairing;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
-use ark_std::vec::Vec;
+use ark_std::{string::{String, ToString}, vec::Vec};
 use sha2::{Digest, Sha256};
 
 use crate::{ProvingKey, ProvingKeyRef, VerifyingKey};
