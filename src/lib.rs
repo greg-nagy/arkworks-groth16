@@ -25,6 +25,9 @@ pub mod r1cs_to_qap;
 /// Data structures used by the prover, verifier, and generator.
 pub mod data_structures;
 
+/// Zero-copy data structures for efficient proving key loading.
+pub mod data_structures_ref;
+
 /// Generate public parameters for the Groth16 zkSNARK construction.
 pub mod generator;
 
@@ -42,6 +45,7 @@ pub mod constraints;
 mod test;
 
 pub use self::data_structures::*;
+pub use self::data_structures_ref::*;
 pub use self::verifier::*;
 
 use ark_crypto_primitives::snark::*;
